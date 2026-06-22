@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meeting-summarizer"
+version = "0.1.0"
+description = "Local-first meeting transcription and summarization pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",
+  "pydantic>=2.7",
+  "python-dotenv>=1.0",
+  "openai>=1.40",
+  "pytest>=8.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+meeting-summarizer = "meeting_summarizer.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meeting_summarizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,4 @@
+outputs/
+audio/
+whisper.cpp/
+.env
