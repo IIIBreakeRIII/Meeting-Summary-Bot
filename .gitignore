@@ -2,3 +2,5 @@ outputs/
 audio/
 whisper.cpp/
 .env
+
+*.DS_Store

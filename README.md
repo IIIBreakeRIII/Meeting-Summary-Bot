@@ -1,5 +1,7 @@
 # meeting-summarizer
 
+[Whisper-Transcript-Generator](https://github.com/IIIBreakeRIII/Whisper-Transcript-Generator) 의 Version 2
+
 `meeting-summarizer`는 iPhone에서 녹음한 `m4a`를 포함한 로컬 오디오를 전사한 뒤, 전사 텍스트만 OpenAI로 보내 회의 요약을 만드는 CLI입니다.
 
 현재 전사는 `whisper.cpp`의 `whisper-cli`로 수행하고, 요약은 OpenAI Responses API를 사용합니다. 전사와 요약 진행 상황은 터미널에 표시됩니다.
