@@ -6,9 +6,12 @@ import shutil
 import subprocess
 import tempfile
 import re
-from dataclasses import dataclass
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from .audio import normalize_audio, probe_duration_seconds
 from .chunking import format_timestamp
@@ -16,6 +19,62 @@ from .schemas import TranscriptDocument, TranscriptSegment
 
 
 _PROGRESS_RE = re.compile(r"progress\s*=\s*(\d+)%")
+_STALL_TIMEOUT_SECONDS = 900
+_POST_100_GRACE_SECONDS = 120
+_OUTPUT_TAIL_LIMIT = 200
+
+
+def _iter_decoded_lines(stream: Any) -> Iterator[str]:
+    while True:
+        raw_line = stream.readline()
+        if not raw_line:
+            break
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+        yield line.rstrip("\r\n")
+
+
+def _read_json_text(path: Path) -> str:
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+@dataclass
+class _ProcessMonitor:
+    last_percent: int | None = None
+    saw_hundred: bool = False
+    last_output_at: float = 0.0
+    last_progress_at: float = 0.0
+    output_tail: deque[str] = field(default_factory=lambda: deque(maxlen=_OUTPUT_TAIL_LIMIT))
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record_line(self, line: str) -> int | None:
+        now = time.monotonic()
+        with self.lock:
+            self.last_output_at = now
+            self.output_tail.append(line)
+            match = _PROGRESS_RE.search(line)
+            if not match:
+                return None
+            percent = int(match.group(1))
+            if percent != self.last_percent:
+                self.last_percent = percent
+                self.last_progress_at = now
+                if percent >= 100:
+                    self.saw_hundred = True
+                return percent
+            return None
+
+    def snapshot(self) -> tuple[int | None, bool, float, float, list[str]]:
+        with self.lock:
+            return (
+                self.last_percent,
+                self.saw_hundred,
+                self.last_output_at,
+                self.last_progress_at,
+                list(self.output_tail),
+            )
 
 
 class TranscriptionBackend(Protocol):
@@ -108,26 +167,76 @@ class WhisperCppBackend:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                text=False,
             )
-            last_percent: int | None = None
-            assert process.stdout is not None
-            for line in process.stdout:
-                line = line.rstrip()
-                if progress is not None:
-                    match = _PROGRESS_RE.search(line)
-                    if match:
-                        percent = int(match.group(1))
-                        if percent != last_percent:
-                            progress(f"전사 진행률 {percent}%")
-                            last_percent = percent
-            return_code = process.wait()
+            start_time = time.monotonic()
+            monitor = _ProcessMonitor(last_output_at=start_time, last_progress_at=start_time)
+
+            def _drain_output() -> None:
+                assert process.stdout is not None
+                for line in _iter_decoded_lines(process.stdout):
+                    percent = monitor.record_line(line)
+                    if progress is not None and percent is not None:
+                        progress(f"전사 진행률 {percent}%")
+
+            reader = threading.Thread(target=_drain_output, daemon=True)
+            reader.start()
+
+            saw_hundred_reported = False
+            return_code: int | None = None
+            while True:
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+
+                last_percent, saw_hundred, last_output_at, last_progress_at, tail = monitor.snapshot()
+                now = time.monotonic()
+                if saw_hundred:
+                    if not saw_hundred_reported and progress is not None:
+                        progress("전사 100% 도달. 결과 정리 중")
+                        saw_hundred_reported = True
+                    if now - last_output_at > _POST_100_GRACE_SECONDS:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        reader.join(timeout=5)
+                        tail_text = "\n".join(tail[-20:])
+                        raise RuntimeError(
+                            "whisper.cpp가 100% 이후 종료되지 않아 중단했습니다.\n"
+                            f"명령: {' '.join(command)}\n"
+                            f"마지막 출력:\n{tail_text}"
+                        )
+                else:
+                    if now - last_output_at > _STALL_TIMEOUT_SECONDS and now - last_progress_at > _STALL_TIMEOUT_SECONDS:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        reader.join(timeout=5)
+                        tail_text = "\n".join(tail[-20:])
+                        raise RuntimeError(
+                            "whisper.cpp 전사가 멈춘 것으로 보여 중단했습니다.\n"
+                            f"명령: {' '.join(command)}\n"
+                            f"마지막 진행률: {last_percent if last_percent is not None else '없음'}\n"
+                            f"마지막 출력:\n{tail_text}"
+                        )
+
+                time.sleep(1.0)
+
+            reader.join(timeout=5)
             if return_code != 0:
+                _, _, _, _, tail = monitor.snapshot()
+                tail_text = "\n".join(tail[-20:])
                 raise RuntimeError(
                     "whisper.cpp 전사에 실패했습니다.\n"
                     f"명령: {' '.join(command)}\n"
-                    f"종료 코드: {return_code}"
+                    f"종료 코드: {return_code}\n"
+                    f"마지막 출력:\n{tail_text}"
                 )
 
             json_path = output_prefix.with_name(f"{output_prefix.name}.json")
@@ -135,7 +244,7 @@ class WhisperCppBackend:
                 raise RuntimeError(
                     f"whisper.cpp JSON 결과 파일을 찾을 수 없습니다: {json_path}"
                 )
-            return json.loads(json_path.read_text(encoding="utf-8"))
+            return json.loads(_read_json_text(json_path))
 
 
 def _parse_whisper_json(raw_result: Any) -> tuple[str | None, list[dict[str, Any]]]:
